@@ -269,6 +269,9 @@ type HermesCronJob = {
   last_run_at?: string
   last_status?: string
   paused_reason?: string | null
+  deliver?: string
+  last_error?: string | null
+  last_delivery_error?: string | null
 }
 
 type GatewayStatus = {
@@ -309,11 +312,45 @@ type MarkdownPreview = {
   exists: boolean
 }
 
+type HermesStatus = {
+  cronFileExists: boolean
+  gatewayPid?: number
+  gatewayProcessLive: boolean
+  gatewayProcessRuntime?: string
+  gatewayState?: string
+  gatewayDiscordState?: string
+  gatewayDiscordUpdatedAt?: number
+  channelDirectoryExists: boolean
+  channelDirectoryUpdatedAt?: number
+  channelDirectoryDiscordEntries: number
+  enabledJobs: HermesCronJob[]
+  qaJob?: HermesCronJob
+  latestOutput?: {
+    path: string
+    updatedAt?: number
+    ack: boolean
+    silent: boolean
+    contentPreview?: string
+  }
+  latestSession?: {
+    path: string
+    updatedAt?: number
+  }
+  deliveryTarget?: string
+  lastError?: string | null
+  lastDeliveryError?: string | null
+  overdueMinutes?: number
+}
+
 const WORKSPACE_ROOT = '/Users/openclaw/.openclaw/workspace'
 const OPENCLAW_TASKS_DB = '/Users/openclaw/.openclaw/tasks/runs.sqlite'
 const OPENCLAW_SESSIONS = '/Users/openclaw/.openclaw/agents/main/sessions/sessions.json'
 const OPENCLAW_CRON = '/Users/openclaw/.openclaw/cron/jobs.json'
 const HERMES_CRON = '/Users/openclaw/.hermes/cron/jobs.json'
+const HERMES_GATEWAY_STATE = '/Users/openclaw/.hermes/gateway_state.json'
+const HERMES_CHANNEL_DIRECTORY = '/Users/openclaw/.hermes/channel_directory.json'
+const HERMES_SESSIONS_DIR = '/Users/openclaw/.hermes/sessions'
+const HERMES_OUTPUT_DIR = '/Users/openclaw/.hermes/cron/output'
 const COORDINATION_TASKS = '/Users/openclaw/.openclaw/workspace/coordination/tasks.json'
 const MEMORY_FILE = '/Users/openclaw/.openclaw/workspace/MEMORY.md'
 const MEMORY_DIR = '/Users/openclaw/.openclaw/workspace/memory'
@@ -322,7 +359,7 @@ const OBSIDIAN_VAULT = '/Users/openclaw/.openclaw/workspace/obsidian-vault'
 const BROWSER_AUTOMATION_SESSIONS = '/Users/openclaw/.openclaw/workspace/skills/browser-automation/state/sessions'
 
 export async function getOpenLabSnapshot(): Promise<OpenLabSnapshot> {
-  const [taskRuns, sessionIndex, coordinationTasks, openClawCronJobs, hermesCronJobs, gatewayStatus, chromeStatus, memoryStatus, projects, memories, docs] = await Promise.all([
+  const [taskRuns, sessionIndex, coordinationTasks, openClawCronJobs, hermesCronState, gatewayStatus, chromeStatus, memoryStatus, projects, memories, docs] = await Promise.all([
     readOpenClawTaskRuns(),
     readJson<SessionIndex>(OPENCLAW_SESSIONS, {}),
     readJson<{ tasks?: CoordinationTask[] }>(COORDINATION_TASKS, { tasks: [] }),
@@ -336,21 +373,25 @@ export async function getOpenLabSnapshot(): Promise<OpenLabSnapshot> {
     buildDocCards(),
   ])
 
+  const hermesCronJobs = hermesCronState.jobs ?? []
+  const hermesStatus = await readHermesStatus(hermesCronJobs)
+
   const liveTasks = buildLiveTasks(taskRuns, sessionIndex)
   const fallbackTasks = liveTasks.length === 0 ? buildCoordinationTasks(coordinationTasks.tasks ?? []) : []
   const tasks = liveTasks.length > 0 ? liveTasks : fallbackTasks
-  const calendarItems = buildCalendarItems(openClawCronJobs.jobs ?? [], hermesCronJobs.jobs ?? [])
+  const calendarItems = buildCalendarItems(openClawCronJobs.jobs ?? [], hermesCronJobs)
   const monitoring = buildMonitoringCards({
     gatewayStatus,
     chromeStatus,
     memoryStatus,
     openClawCronJobs: openClawCronJobs.jobs ?? [],
-    hermesCronJobs: hermesCronJobs.jobs ?? [],
+    hermesCronJobs,
+    hermesStatus,
     taskRuns,
     sessionIndex,
   })
-  const alerts = await buildAlerts(taskRuns, openClawCronJobs.jobs ?? [], hermesCronJobs.jobs ?? [])
-  const agents = buildAgentCards({ taskRuns, sessionIndex, openClawCronJobs: openClawCronJobs.jobs ?? [], hermesCronJobs: hermesCronJobs.jobs ?? [], chromeStatus })
+  const alerts = await buildAlerts(taskRuns, openClawCronJobs.jobs ?? [], hermesCronJobs, hermesStatus)
+  const agents = buildAgentCards({ taskRuns, sessionIndex, openClawCronJobs: openClawCronJobs.jobs ?? [], hermesCronJobs, chromeStatus, hermesStatus })
   const office = buildOfficeSnapshot({ tasks, calendarItems, monitoring, alerts, agents, projects, docs, memories })
   const toolBuilder = buildToolBuilderSnapshot({ tasks, calendarItems, projects, docs, memories, monitoring, office })
 
@@ -369,7 +410,7 @@ export async function getOpenLabSnapshot(): Promise<OpenLabSnapshot> {
       hermesSchedules: {
         status: calendarItems.some((item) => item.system === 'hermes') ? 'live' : 'partial',
         detail: calendarItems.some((item) => item.system === 'hermes')
-          ? 'Live from ~/.hermes/cron/jobs.json with OpenClaw cron merged in'
+          ? 'Live from ~/.hermes/cron/jobs.json with gateway, output, and delivery telemetry layered in'
           : 'Only OpenClaw cron currently available',
       },
     },
@@ -475,6 +516,89 @@ async function readChromeStatus(): Promise<ChromeStatus> {
     }
   } catch {
     return { reachable: false, targetCount: 0, savedSessions }
+  }
+}
+
+async function readHermesStatus(jobs: HermesCronJob[]): Promise<HermesStatus> {
+  const qaJob = jobs.find((job) => /hermes qa/i.test(job.name)) ?? jobs.find((job) => job.enabled) ?? jobs[0]
+  const [gatewayState, gatewayStateStat, channelDirectory, channelDirectoryStat, latestOutput, latestSession] = await Promise.all([
+    readJson<Record<string, unknown>>(HERMES_GATEWAY_STATE, {}),
+    safeStat(HERMES_GATEWAY_STATE),
+    readJson<{ updated_at?: string; platforms?: { discord?: Array<Record<string, unknown>> } }>(HERMES_CHANNEL_DIRECTORY, {}),
+    safeStat(HERMES_CHANNEL_DIRECTORY),
+    qaJob ? readLatestHermesOutput(qaJob.id) : Promise.resolve(undefined),
+    qaJob ? readLatestHermesSession(qaJob.id) : Promise.resolve(undefined),
+  ])
+
+  const gatewayPid = typeof gatewayState.pid === 'number' ? gatewayState.pid : undefined
+  const [gatewayProcessLive, gatewayProcessRuntime] = gatewayPid ? await readProcessLiveness(gatewayPid) : [false, undefined]
+  const discordState = (gatewayState.platforms as { discord?: { state?: string; updated_at?: string } } | undefined)?.discord
+  const channelDirectoryEntries = Array.isArray(channelDirectory.platforms?.discord) ? channelDirectory.platforms.discord.length : 0
+  const lastRunAt = qaJob?.last_run_at ? Date.parse(qaJob.last_run_at) : undefined
+  const nextRunAt = qaJob?.next_run_at ? Date.parse(qaJob.next_run_at) : undefined
+  const overdueMinutes = qaJob?.enabled && lastRunAt && nextRunAt
+    ? Math.max(0, Math.round((Date.now() - nextRunAt) / 60000))
+    : 0
+
+  return {
+    cronFileExists: jobs.length > 0,
+    gatewayPid,
+    gatewayProcessLive,
+    gatewayProcessRuntime,
+    gatewayState: typeof gatewayState.gateway_state === 'string' ? gatewayState.gateway_state : gatewayStateStat ? 'unknown' : undefined,
+    gatewayDiscordState: discordState?.state,
+    gatewayDiscordUpdatedAt: discordState?.updated_at ? Date.parse(discordState.updated_at) : undefined,
+    channelDirectoryExists: Boolean(channelDirectoryStat),
+    channelDirectoryUpdatedAt: channelDirectory.updated_at ? Date.parse(channelDirectory.updated_at) : channelDirectoryStat?.mtimeMs,
+    channelDirectoryDiscordEntries: channelDirectoryEntries,
+    enabledJobs: jobs.filter((job) => job.enabled),
+    qaJob,
+    latestOutput,
+    latestSession,
+    deliveryTarget: qaJob?.deliver,
+    lastError: qaJob?.last_error,
+    lastDeliveryError: qaJob?.last_delivery_error,
+    overdueMinutes,
+  }
+}
+
+async function readLatestHermesOutput(jobId: string): Promise<HermesStatus['latestOutput']> {
+  const dir = `${HERMES_OUTPUT_DIR}/${jobId}`
+  const files = (await readDirectoryFilenames(dir)).filter((file) => file.endsWith('.md')).sort()
+  const latest = files.at(-1)
+  if (!latest) return undefined
+  const path = `${dir}/${latest}`
+  const [raw, fileStat] = await Promise.all([readFile(path, 'utf8').catch(() => ''), safeStat(path)])
+  return {
+    path,
+    updatedAt: fileStat?.mtimeMs,
+    ack: /\[ACK\]/.test(raw),
+    silent: /^\s*\[SILENT\]\s*$/m.test(raw),
+    contentPreview: summarizeTaskText(raw.split(/\r?\n/).filter(Boolean).slice(-8).join(' ')),
+  }
+}
+
+async function readLatestHermesSession(jobId: string): Promise<HermesStatus['latestSession']> {
+  const files = (await readDirectoryFilenames(HERMES_SESSIONS_DIR))
+    .filter((file) => file.startsWith(`session_cron_${jobId}_`) && file.endsWith('.json'))
+    .sort()
+  const latest = files.at(-1)
+  if (!latest) return undefined
+  const path = `${HERMES_SESSIONS_DIR}/${latest}`
+  const fileStat = await safeStat(path)
+  return {
+    path,
+    updatedAt: fileStat?.mtimeMs,
+  }
+}
+
+async function readProcessLiveness(pid: number): Promise<[boolean, string | undefined]> {
+  try {
+    const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'etime='])
+    const runtime = stdout.trim()
+    return [Boolean(runtime), runtime || undefined]
+  } catch {
+    return [false, undefined]
   }
 }
 
@@ -710,6 +834,7 @@ function buildMonitoringCards(input: {
   memoryStatus: MemoryStatus
   openClawCronJobs: OpenClawCronJob[]
   hermesCronJobs: HermesCronJob[]
+  hermesStatus: HermesStatus
   taskRuns: OpenClawTaskRunRow[]
   sessionIndex: SessionIndex
 }): OpenLabMonitorCard[] {
@@ -788,24 +913,46 @@ function buildMonitoringCards(input: {
     {
       id: 'hermes',
       title: 'Hermes',
-      status: enabledHermesCron.length > 0
-        ? enabledHermesCron.some((job) => job.last_status && job.last_status !== 'ok') ? 'warning' : 'healthy'
-        : input.hermesCronJobs.length > 0 ? 'placeholder' : 'offline',
+      status: !input.hermesStatus.cronFileExists
+        ? 'offline'
+        : input.hermesStatus.lastDeliveryError || input.hermesStatus.lastError
+          ? 'critical'
+          : !input.hermesStatus.gatewayProcessLive || input.hermesStatus.gatewayDiscordState !== 'connected'
+            ? 'warning'
+            : input.hermesStatus.overdueMinutes && input.hermesStatus.overdueMinutes > 5
+              ? 'warning'
+              : enabledHermesCron.some((job) => job.last_status && job.last_status !== 'ok')
+                ? 'warning'
+                : 'healthy',
       summary: enabledHermesCron.length > 0
-        ? `${enabledHermesCron.length} Hermes job(s) enabled, including QA review coverage.`
+        ? `${enabledHermesCron.length} Hermes job(s) enabled, gateway ${input.hermesStatus.gatewayDiscordState === 'connected' ? 'connected' : 'not confirmed'}, latest QA ${formatRelative(input.hermesStatus.latestOutput?.updatedAt)}.`
         : input.hermesCronJobs.length > 0
           ? 'Hermes config exists but no enabled jobs were found.'
           : 'Hermes cron file not found.',
       detail: enabledHermesCron[0]
-        ? `${enabledHermesCron[0].name} next runs ${formatDateTime(enabledHermesCron[0].next_run_at)}.`
+        ? [
+            `${enabledHermesCron[0].name} last ran ${formatRelative(enabledHermesCron[0].last_run_at ? Date.parse(enabledHermesCron[0].last_run_at) : undefined)} and next runs ${formatDateTime(enabledHermesCron[0].next_run_at)}.`,
+            input.hermesStatus.deliveryTarget ? `Delivery target: ${input.hermesStatus.deliveryTarget}.` : undefined,
+            input.hermesStatus.latestOutput?.ack ? 'Latest output ended with [ACK].' : input.hermesStatus.latestOutput?.silent ? 'Latest output was [SILENT].' : 'Latest output marker not confirmed.',
+            input.hermesStatus.lastDeliveryError || input.hermesStatus.lastError ? `Last error: ${input.hermesStatus.lastDeliveryError || input.hermesStatus.lastError}.` : undefined,
+          ].filter(Boolean).join(' ')
         : input.hermesCronJobs[0]?.paused_reason || 'No enabled Hermes schedules available.',
       metrics: compactMetrics([
         { label: 'Jobs', value: String(input.hermesCronJobs.length) },
         { label: 'Enabled', value: String(enabledHermesCron.length) },
-        { label: 'Healthy', value: String(enabledHermesCron.filter((job) => (job.last_status ?? 'ok') === 'ok').length) },
+        { label: 'Gateway', value: input.hermesStatus.gatewayProcessLive ? 'live' : 'missing' },
+        { label: 'Discord', value: input.hermesStatus.gatewayDiscordState ?? 'unknown' },
+        { label: 'Output', value: formatRelative(input.hermesStatus.latestOutput?.updatedAt) },
+        { label: 'Delivery', value: input.hermesStatus.deliveryTarget ?? 'local' },
       ]),
-      evidence: [HERMES_CRON],
-      live: enabledHermesCron.length > 0,
+      evidence: compact([
+        HERMES_CRON,
+        HERMES_GATEWAY_STATE,
+        input.hermesStatus.latestOutput?.path,
+        input.hermesStatus.latestSession?.path,
+        HERMES_CHANNEL_DIRECTORY,
+      ].map((value) => value ? toWorkspacePath(value) : value)),
+      live: enabledHermesCron.length > 0 || input.hermesStatus.gatewayProcessLive,
     },
     {
       id: 'cron',
@@ -827,7 +974,7 @@ function buildMonitoringCards(input: {
   ]
 }
 
-async function buildAlerts(taskRuns: OpenClawTaskRunRow[], openClawCronJobs: OpenClawCronJob[], hermesCronJobs: HermesCronJob[]): Promise<OpenLabAlert[]> {
+async function buildAlerts(taskRuns: OpenClawTaskRunRow[], openClawCronJobs: OpenClawCronJob[], hermesCronJobs: HermesCronJob[], hermesStatus: HermesStatus): Promise<OpenLabAlert[]> {
   const taskAlerts = taskRuns
     .filter((row) => row.status === 'failed' || row.status === 'timed_out' || row.status === 'running')
     .slice(0, 5)
@@ -866,9 +1013,47 @@ async function buildAlerts(taskRuns: OpenClawTaskRunRow[], openClawCronJobs: Ope
       })),
   ]
 
+  const hermesAlerts = compact<OpenLabAlert>([
+    hermesStatus.lastDeliveryError ? {
+      id: 'hermes-delivery-error',
+      title: 'Hermes delivery error',
+      level: 'critical',
+      source: 'hermes delivery',
+      timeLabel: formatRelative(hermesStatus.qaJob?.last_run_at ? Date.parse(hermesStatus.qaJob.last_run_at) : hermesStatus.latestOutput?.updatedAt),
+      detail: hermesStatus.lastDeliveryError,
+      live: true,
+    } : null,
+    hermesStatus.lastError ? {
+      id: 'hermes-run-error',
+      title: 'Hermes job error',
+      level: 'warning',
+      source: 'hermes cron',
+      timeLabel: formatRelative(hermesStatus.qaJob?.last_run_at ? Date.parse(hermesStatus.qaJob.last_run_at) : hermesStatus.latestSession?.updatedAt),
+      detail: hermesStatus.lastError,
+      live: true,
+    } : null,
+    hermesStatus.qaJob?.enabled && hermesStatus.overdueMinutes && hermesStatus.overdueMinutes > 5 ? {
+      id: 'hermes-overdue',
+      title: 'Hermes QA appears overdue',
+      level: 'warning',
+      source: 'hermes scheduler',
+      timeLabel: `${hermesStatus.overdueMinutes}m late`,
+      detail: `${hermesStatus.qaJob.name} missed its expected next run window.`,
+      live: true,
+    } : null,
+    hermesStatus.enabledJobs.length > 0 && !hermesStatus.gatewayProcessLive ? {
+      id: 'hermes-gateway-missing',
+      title: 'Hermes gateway process not confirmed',
+      level: 'critical',
+      source: 'hermes gateway',
+      timeLabel: formatRelative(hermesStatus.gatewayDiscordUpdatedAt),
+      detail: 'A Hermes job is enabled, but the gateway PID is not live in the local process table.',
+      live: true,
+    } : null,
+  ])
   const incidentAlerts = await readIncidentAlerts()
 
-  return [...taskAlerts, ...cronAlerts, ...incidentAlerts]
+  return [...taskAlerts, ...cronAlerts, ...hermesAlerts, ...incidentAlerts]
     .sort((a, b) => rankAlertLevel(b.level) - rankAlertLevel(a.level))
     .slice(0, 8)
 }
@@ -879,6 +1064,7 @@ function buildAgentCards(input: {
   openClawCronJobs: OpenClawCronJob[]
   hermesCronJobs: HermesCronJob[]
   chromeStatus: ChromeStatus
+  hermesStatus: HermesStatus
 }): OpenLabAgentCard[] {
   const mainSession = input.sessionIndex['agent:main:main']
   const runningSubagents = input.taskRuns.filter((row) => row.runtime === 'subagent' && row.status === 'running')
@@ -926,14 +1112,27 @@ function buildAgentCards(input: {
       name: 'Hermes QA',
       role: 'Review and monitoring layer',
       team: 'Hermes',
-      status: enabledHermes.length > 0 ? ((enabledHermes[0].last_status ?? 'ok') === 'ok' ? 'monitoring' : 'attention') : 'idle',
-      summary: enabledHermes.length > 0 ? `${enabledHermes[0].name} is the active Hermes monitor.` : 'Hermes jobs are configured but not currently enabled.',
-      detail: enabledHermes[0]?.next_run_at ? `Next run ${formatDateTime(enabledHermes[0].next_run_at)}.` : input.hermesCronJobs[0]?.paused_reason || 'No next Hermes run scheduled.',
-      lastSeen: formatRelative(enabledHermes[0]?.last_run_at ? Date.parse(enabledHermes[0].last_run_at) : undefined),
+      status: enabledHermes.length > 0
+        ? (input.hermesStatus.lastDeliveryError || input.hermesStatus.lastError || !input.hermesStatus.gatewayProcessLive ? 'attention' : (enabledHermes[0].last_status ?? 'ok') === 'ok' ? 'monitoring' : 'attention')
+        : 'idle',
+      summary: enabledHermes.length > 0
+        ? `${enabledHermes[0].name} is active, delivering to ${input.hermesStatus.deliveryTarget ?? 'local'}, latest output ${formatRelative(input.hermesStatus.latestOutput?.updatedAt)}.`
+        : 'Hermes jobs are configured but not currently enabled.',
+      detail: enabledHermes[0]?.next_run_at
+        ? [
+            `Next run ${formatDateTime(enabledHermes[0].next_run_at)}.`,
+            input.hermesStatus.gatewayProcessLive ? `Gateway PID ${input.hermesStatus.gatewayPid ?? 'unknown'} has been live ${input.hermesStatus.gatewayProcessRuntime ?? 'for an unknown duration'}.` : 'Gateway process is not confirmed live.',
+            input.hermesStatus.latestOutput?.contentPreview ? `Latest output: ${input.hermesStatus.latestOutput.contentPreview}` : undefined,
+          ].filter(Boolean).join(' ')
+        : input.hermesCronJobs[0]?.paused_reason || 'No next Hermes run scheduled.',
+      lastSeen: formatRelative(enabledHermes[0]?.last_run_at ? Date.parse(enabledHermes[0].last_run_at) : input.hermesStatus.latestOutput?.updatedAt),
       evidenceMode: enabledHermes.length > 0 ? 'live' : 'mixed',
       metrics: compactMetrics([
         { label: 'Enabled jobs', value: String(enabledHermes.length) },
         { label: 'Last status', value: enabledHermes[0]?.last_status ?? 'n/a' },
+        { label: 'Gateway', value: input.hermesStatus.gatewayProcessLive ? 'live' : 'missing' },
+        { label: 'Discord', value: input.hermesStatus.gatewayDiscordState ?? 'unknown' },
+        { label: 'Output', value: formatRelative(input.hermesStatus.latestOutput?.updatedAt) },
         enabledHermes[0]?.schedule_display ? { label: 'Schedule', value: enabledHermes[0].schedule_display } : null,
       ]),
     },
